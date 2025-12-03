@@ -1,12 +1,14 @@
 import os
 from datetime import datetime
 from functools import lru_cache
+from typing import Optional
 
 import requests
 import stripe
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt
+from pydantic import BaseModel
 from sqlalchemy import (
     create_engine,
     Column,
@@ -29,6 +31,20 @@ AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN")
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")  # your API identifier in Auth0
 AUTH0_ISSUER = f"https://{AUTH0_DOMAIN}/" if AUTH0_DOMAIN else None
 
+# Stripe price IDs (set these in Render)
+PRICE_STANDARD_MONTHLY = os.getenv("PRICE_STANDARD_MONTHLY")
+PRICE_STANDARD_YEARLY = os.getenv("PRICE_STANDARD_YEARLY")
+PRICE_PRO_MONTHLY = os.getenv("PRICE_PRO_MONTHLY")
+PRICE_PRO_YEARLY = os.getenv("PRICE_PRO_YEARLY")
+PRICE_ACADEMIC_YEARLY = os.getenv("PRICE_ACADEMIC_YEARLY")
+PRICE_DEPT_YEARLY = os.getenv("PRICE_DEPT_YEARLY")
+
+# Frontend URL (your Streamlit app)
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "https://cubesimprov2-lt6hcgkvpdvygnwbktyqdg.streamlit.app",
+)
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
@@ -36,6 +52,35 @@ if not STRIPE_API_KEY:
     raise RuntimeError("STRIPE_API_KEY is not set")
 
 stripe.api_key = STRIPE_API_KEY
+
+# Map plan_key -> Stripe price ID (used by /create-checkout-session)
+PLAN_TO_PRICE = {
+    "standard_monthly": PRICE_STANDARD_MONTHLY,
+    "standard_yearly": PRICE_STANDARD_YEARLY,
+    "pro_monthly": PRICE_PRO_MONTHLY,
+    "pro_yearly": PRICE_PRO_YEARLY,
+    "academic_yearly": PRICE_ACADEMIC_YEARLY,
+    "dept_yearly": PRICE_DEPT_YEARLY,
+}
+
+# Map Stripe price/plan IDs -> logical plan ("standard" / "pro")
+PRICE_TO_PLAN = {}
+for pid in [
+    PRICE_STANDARD_MONTHLY,
+    PRICE_STANDARD_YEARLY,
+]:
+    if pid:
+        PRICE_TO_PLAN[pid] = "standard"
+
+for pid in [
+    PRICE_PRO_MONTHLY,
+    PRICE_PRO_YEARLY,
+    PRICE_ACADEMIC_YEARLY,  # treat academic as Pro-level features
+    PRICE_DEPT_YEARLY,      # department license also Pro-level
+]:
+    if pid:
+        PRICE_TO_PLAN[pid] = "pro"
+
 
 # =========================
 # Database setup
@@ -156,13 +201,238 @@ def health():
 
 
 # =========================
-# /me/subscription – for Streamlit
+# Pydantic models for requests
+# =========================
+class SyncUserRequest(BaseModel):
+    auth0_sub: str
+    email: Optional[str] = None
+    stripe_customer_id: Optional[str] = None
+
+
+class CheckoutSessionRequest(BaseModel):
+    plan_key: str
+    email: str
+    auth0_sub: Optional[str] = None  # optional, front-end can add later
+
+
+class PortalSessionRequest(BaseModel):
+    customer_id: str
+
+
+# =========================
+# /sync-user – called by Streamlit on login
+# =========================
+@app.post("/sync-user")
+def sync_user(req: SyncUserRequest, db: Session = Depends(get_db)):
+    """
+    Best-effort sync of Auth0 identity into the backend DB.
+
+    Body:
+      {
+        "auth0_sub": "...",
+        "email": "...",
+        "stripe_customer_id": "cus_xxx" (optional)
+      }
+    """
+    user = db.query(User).filter(User.auth0_sub == req.auth0_sub).first()
+    if not user:
+        user = User(
+            auth0_sub=req.auth0_sub,
+            email=req.email,
+            stripe_customer_id=req.stripe_customer_id,
+        )
+        db.add(user)
+    else:
+        # Update email / stripe_customer_id if provided
+        if req.email and user.email != req.email:
+            user.email = req.email
+        if req.stripe_customer_id and user.stripe_customer_id != req.stripe_customer_id:
+            user.stripe_customer_id = req.stripe_customer_id
+
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(user)
+    return {"ok": True}
+
+
+# =========================
+# /subscription-state – used by Streamlit sidebar
+# =========================
+@app.get("/subscription-state")
+def subscription_state(auth0_sub: str, db: Session = Depends(get_db)):
+    """
+    Returns the subscription state for a given Auth0 subject.
+
+    Query param: ?auth0_sub=...
+    Returns:
+      {
+        "plan": "standard" | "pro" | "none",
+        "status": "active" | "trialing" | "canceled" | "none",
+        "price_id": "price_xxx" | null,
+        "current_period_end": "2025-01-01T00:00:00Z" | null,
+        "customer_id": "cus_xxx" | null
+      }
+    """
+    user = db.query(User).filter(User.auth0_sub == auth0_sub).first()
+    if not user:
+        return {
+            "plan": "none",
+            "status": "none",
+            "price_id": None,
+            "current_period_end": None,
+            "customer_id": None,
+        }
+
+    price_id = None
+    plan = "none"
+    status = user.status or "none"
+    current_period_end_iso = None
+    customer_id = user.stripe_customer_id
+
+    if user.stripe_subscription_id:
+        try:
+            sub = stripe.Subscription.retrieve(user.stripe_subscription_id)
+            status = sub["status"]
+            # Prefer price.id; fall back to plan.id if needed
+            item = sub["items"]["data"][0]
+            price_obj = item.get("price")
+            plan_obj = item.get("plan")
+            price_id = (price_obj or {}).get("id") or (plan_obj or {}).get("id")
+            cpe = sub.get("current_period_end")
+            if cpe:
+                current_period_end_iso = datetime.utcfromtimestamp(cpe).isoformat() + "Z"
+        except Exception:
+            # fall back to whatever we stored
+            price_id = user.plan
+            current_period_end_iso = user.trial_end.isoformat() + "Z" if user.trial_end else None
+
+    # Map price_id -> logical plan name
+    if price_id and price_id in PRICE_TO_PLAN:
+        plan = PRICE_TO_PLAN[price_id]
+    else:
+        # fall back if user.plan already stores "standard"/"pro"
+        if user.plan in ("standard", "pro"):
+            plan = user.plan
+
+    return {
+        "plan": plan,
+        "status": status,
+        "price_id": price_id,
+        "current_period_end": current_period_end_iso,
+        "customer_id": customer_id,
+    }
+
+
+# =========================
+# /create-checkout-session – used by Streamlit to start Stripe Checkout
+# =========================
+@app.post("/create-checkout-session")
+def create_checkout_session(
+    req: CheckoutSessionRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Body:
+      {
+        "plan_key": "standard_monthly" | "standard_yearly" | "pro_monthly" | "pro_yearly" | "academic_yearly" | "dept_yearly",
+        "email": "...",
+        "auth0_sub": "..." (optional)
+      }
+    Returns:
+      { "url": "https://checkout.stripe.com/..." }
+    """
+    price_id = PLAN_TO_PRICE.get(req.plan_key)
+    if not price_id:
+        raise HTTPException(status_code=400, detail=f"Unknown plan_key: {req.plan_key}")
+
+    # Upsert user by auth0_sub or email (best effort)
+    user = None
+    if req.auth0_sub:
+        user = db.query(User).filter(User.auth0_sub == req.auth0_sub).first()
+    if not user and req.email:
+        user = db.query(User).filter(User.email == req.email).first()
+
+    if not user:
+        if not req.auth0_sub:
+            # fallback if no auth0_sub yet
+            req.auth0_sub = f"email:{req.email}"
+        user = User(auth0_sub=req.auth0_sub, email=req.email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    # Create or reuse Stripe customer
+    customer_id = user.stripe_customer_id
+    if customer_id:
+        try:
+            stripe.Customer.retrieve(customer_id)
+        except Exception:
+            customer_id = None
+
+    if not customer_id:
+        customer = stripe.Customer.create(email=req.email)
+        customer_id = customer["id"]
+        user.stripe_customer_id = customer_id
+        user.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(user)
+
+    success_url = f"{FRONTEND_URL}?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = FRONTEND_URL
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            customer=customer_id,
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "auth0_sub": req.auth0_sub or "",
+                "plan_key": req.plan_key,
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
+
+    return {"url": session.url}
+
+
+# =========================
+# /create-portal-session – Stripe Billing Portal
+# =========================
+@app.post("/create-portal-session")
+def create_portal_session(req: PortalSessionRequest):
+    """
+    Body:
+      { "customer_id": "cus_xxx" }
+    Returns:
+      { "url": "https://billing.stripe.com/..." }
+    """
+    try:
+        portal_session = stripe.billing_portal.Session.create(
+            customer=req.customer_id,
+            return_url=FRONTEND_URL,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe portal error: {e}")
+
+    return {"url": portal_session.url}
+
+
+# =========================
+# /me/subscription – (Auth0-protected) optional
 # =========================
 @app.get("/me/subscription")
 def get_my_subscription(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    """
+    Alternative, Auth0-protected subscription endpoint.
+    Not currently used by Streamlit front-end.
+    """
     payload = get_current_user_payload(request)
     auth0_sub = payload["sub"]
     email = payload.get("email")
@@ -244,7 +514,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         customer_id = sub["customer"]
         subscription_id = sub["id"]
         status = sub["status"]
-        plan_id = sub["items"]["data"][0]["plan"]["id"]
+
+        item = sub["items"]["data"][0]
+        price_obj = item.get("price")
+        plan_obj = item.get("plan")
+        plan_id = (price_obj or {}).get("id") or (plan_obj or {}).get("id")
+
         trial_end = (
             datetime.fromtimestamp(sub["trial_end"]) if sub.get("trial_end") else None
         )
