@@ -389,3 +389,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         db.commit()
 
     return {"received": True}
+
+@app.get("/debug/prices")
+def debug_prices():
+    return PRICE_MAP
