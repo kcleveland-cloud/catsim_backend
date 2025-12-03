@@ -17,20 +17,19 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# Frontend – your Streamlit dev URL
 FRONTEND_URL = os.getenv(
     "FRONTEND_URL",
     "https://cubesimprov2-noruuoxdtsrjzdskhuobbr.streamlit.app",
 )
 
-# Stripe prices – MUST be set in Render
+# These match your Render screenshot: PRICE_STANDARD_MONTHLY, etc.
 PRICE_MAP = {
-    "standard_monthly": os.getenv("STRIPE_PRICE_STANDARD_MONTHLY"),
-    "standard_yearly": os.getenv("STRIPE_PRICE_STANDARD_YEARLY"),
-    "pro_monthly": os.getenv("STRIPE_PRICE_PRO_MONTHLY"),
-    "pro_yearly": os.getenv("STRIPE_PRICE_PRO_YEARLY"),
-    "academic_yearly": os.getenv("STRIPE_PRICE_ACADEMIC_YEARLY"),
-    "dept_yearly": os.getenv("STRIPE_PRICE_DEPT_YEARLY"),
+    "standard_monthly": os.getenv("PRICE_STANDARD_MONTHLY"),
+    "standard_yearly": os.getenv("PRICE_STANDARD_YEARLY"),
+    "pro_monthly": os.getenv("PRICE_PRO_MONTHLY"),
+    "pro_yearly": os.getenv("PRICE_PRO_YEARLY"),
+    "academic_yearly": os.getenv("PRICE_ACADEMIC_YEARLY"),
+    "dept_yearly": os.getenv("PRICE_DEPT_YEARLY"),
 }
 
 if not DATABASE_URL:
@@ -66,16 +65,14 @@ class User(Base):
 
 Base.metadata.create_all(bind=engine)
 
-
 # =========================
 # FastAPI app
 # =========================
 app = FastAPI()
 
-# Allow Streamlit + local dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock this to FRONTEND_URL later
+    allow_origins=["*"],   # later: restrict to FRONTEND_URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -109,35 +106,39 @@ class PortalPayload(BaseModel):
 
 
 # =========================
-# Health
+# Health & debug
 # =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+@app.get("/debug/prices")
+def debug_prices():
+    """Show which Stripe prices the backend sees (for debugging only)."""
+    return PRICE_MAP
+
+
 # =========================
-# Simple user sync (from Streamlit)
+# Simple user sync from Streamlit
 # =========================
 @app.post("/sync-user")
 def sync_user(payload: SyncUserPayload, db: Session = Depends(get_db)):
     if not payload.email:
         raise HTTPException(status_code=400, detail="Email is required")
 
-    user = (
-        db.query(User)
-        .filter(User.email == payload.email)
-        .first()
-    )
+    email = payload.email.strip().lower()
+
+    user = db.query(User).filter(User.email == email).first()
     if not user:
         user = User(
             auth0_sub=payload.auth0_sub,
-            email=payload.email,
+            email=email,
             stripe_customer_id=payload.stripe_customer_id,
+            created_at=datetime.utcnow(),
         )
         db.add(user)
     else:
-        # update basic fields
         if payload.auth0_sub and not user.auth0_sub:
             user.auth0_sub = payload.auth0_sub
         if payload.stripe_customer_id:
@@ -154,8 +155,11 @@ def sync_user(payload: SyncUserPayload, db: Session = Depends(get_db)):
 # Subscription state for Streamlit
 # =========================
 @app.get("/subscription-state")
-def subscription_state(auth0_sub: Optional[str] = None, email: Optional[str] = None,
-                       db: Session = Depends(get_db)):
+def subscription_state(
+    auth0_sub: Optional[str] = None,
+    email: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """
     Called from Streamlit: we pass auth0_sub; falls back to email if needed.
     """
@@ -165,7 +169,7 @@ def subscription_state(auth0_sub: Optional[str] = None, email: Optional[str] = N
     if auth0_sub:
         user = q.filter(User.auth0_sub == auth0_sub).first()
     if not user and email:
-        user = q.filter(User.email == email).first()
+        user = q.filter(User.email == email.strip().lower()).first()
 
     if not user:
         return {
@@ -201,7 +205,7 @@ def create_checkout_session(payload: CheckoutPayload, db: Session = Depends(get_
         raise HTTPException(
             status_code=500,
             detail=f"Missing Stripe price id for {plan_key}. "
-                   f"Check STRIPE_PRICE_* env vars in Render.",
+                   f"Check PRICE_* env vars in Render.",
         )
 
     # find or create customer by email
@@ -224,7 +228,6 @@ def create_checkout_session(payload: CheckoutPayload, db: Session = Depends(get_
             allow_promotion_codes=True,
         )
     except stripe.error.StripeError as e:
-        # Bubble up Stripe errors clearly
         raise HTTPException(status_code=400, detail=str(e))
 
     # Upsert user row with customer id
