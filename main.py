@@ -71,12 +71,12 @@ class SyncUserRequest(UserBase):
 class SubscriptionStateRequest(UserBase):
     pass
 
-class CheckoutSessionRequest(UserBase):
-    tier: Literal["standard", "pro"]
+# class CheckoutSessionRequest(UserBase):
+#    tier: Literal["standard", "pro"]
 
     # Optional override URLs; otherwise we derive from FRONTEND_BASE_URL
-    success_url: Optional[HttpUrl] = None
-    cancel_url: Optional[HttpUrl] = None
+#    success_url: Optional[HttpUrl] = None
+#    cancel_url: Optional[HttpUrl] = None
 
 class PortalSessionRequest(BaseModel):
     user_id: Optional[str] = None
@@ -208,15 +208,51 @@ def subscription_state(body: SubscriptionStateRequest):
 
 
 @app.post("/create-checkout-session")
-def create_checkout_session(body: CheckoutSessionRequest):
+async def create_checkout_session(request: Request):
     """
     Create a Stripe Checkout Session for Standard or Pro subscription.
-    Frontend will redirect the user to session.url.
+
+    Accepts a very flexible JSON body from the frontend. Examples:
+      {
+        "user_id": "...",
+        "email": "...",
+        "name": "Keith",
+        "tier": "pro"
+      }
+
+      or even:
+      {
+        "auth0_sub": "...",
+        "email": "...",
+        "plan": "standard"
+      }
     """
     try:
-        customer = find_or_create_customer(body.user_id, body.email, body.name)
+        data = await request.json()
 
-        if body.tier == "standard":
+        # --- Extract user identity ---
+        user_id = data.get("user_id") or data.get("auth0_sub")
+        email = data.get("email")
+        name = data.get("name")
+
+        if not user_id or not email:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing user_id or email for checkout session."
+            )
+
+        # --- Determine tier/plan ---
+        # Accepts "tier" or "plan", case-insensitive, defaults to "pro"
+        raw_tier = (data.get("tier") or data.get("plan") or "pro").lower()
+        if raw_tier not in ("standard", "pro"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid tier/plan '{raw_tier}', expected 'standard' or 'pro'."
+            )
+        tier = raw_tier
+
+        # Map to Stripe price ID
+        if tier == "standard":
             price_id = STRIPE_PRICE_STANDARD
         else:
             price_id = STRIPE_PRICE_PRO
@@ -224,17 +260,24 @@ def create_checkout_session(body: CheckoutSessionRequest):
         if not price_id:
             raise HTTPException(
                 status_code=500,
-                detail=f"Missing Stripe price id for tier '{body.tier}'. "
-                       "Set STRIPE_PRICE_STANDARD / STRIPE_PRICE_PRO."
+                detail=f"Missing Stripe price id for tier '{tier}'. "
+                       "Set STRIPE_PRICE_STANDARD / STRIPE_PRICE_PRO in env."
             )
 
-        success_url = str(body.success_url) if body.success_url else (
-            FRONTEND_BASE_URL.rstrip("/") + "/?checkout=success&session_id={CHECKOUT_SESSION_ID}"
+        # --- Build URLs (allow overrides from frontend or use defaults) ---
+        success_url = data.get("success_url") or (
+            FRONTEND_BASE_URL.rstrip("/")
+            + "/?checkout=success&session_id={CHECKOUT_SESSION_ID}"
         )
-        cancel_url = str(body.cancel_url) if body.cancel_url else (
-            FRONTEND_BASE_URL.rstrip("/") + "/?checkout=cancelled"
+        cancel_url = data.get("cancel_url") or (
+            FRONTEND_BASE_URL.rstrip("/")
+            + "/?checkout=cancelled"
         )
 
+        # --- Find or create Stripe customer ---
+        customer = find_or_create_customer(user_id, email, name)
+
+        # --- Create Stripe Checkout session ---
         session = stripe.checkout.Session.create(
             mode="subscription",
             customer=customer.id,
@@ -250,17 +293,13 @@ def create_checkout_session(body: CheckoutSessionRequest):
         )
 
         return {"id": session.id, "url": session.url}
+
     except HTTPException:
         raise
     except Exception as e:
         print("create_checkout_session error:", repr(e))
         raise HTTPException(status_code=500, detail=f"CHECKOUT_ERROR: {e}")
 
-
-PORTAL_RETURN_URL = os.getenv(
-    "PORTAL_RETURN_URL",
-    FRONTEND_BASE_URL.rstrip("/")  # user returns to app after managing billing
-)
 
 @app.post("/create-portal-session")
 def create_portal_session(body: PortalSessionRequest):
