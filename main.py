@@ -401,25 +401,33 @@ def create_checkout_session(
 #    body: { "customer_id": "cus_xxx" }
 # ============================================================
 
+from pydantic import BaseModel
+from fastapi import HTTPException
+
+FRONTEND_RETURN_URL = os.getenv(
+    "PORTAL_RETURN_URL",
+    "https://your-streamlit-app-url"  # <-- set this
+)
+
+class PortalSessionRequest(BaseModel):
+    user_id: str  # Auth0 sub or whatever you're using
+
+
 @app.post("/create-portal-session")
-def create_portal_session(
-    payload: dict = Body(...),
-):
-    customer_id = payload.get("customer_id")
-    if not customer_id:
-        raise HTTPException(status_code=400, detail="Missing customer_id")
-
-    return_url = FRONTEND_BASE_URL
-
+def create_portal_session(body: PortalSessionRequest):
     try:
-        portal_session = stripe.billing_portal.Session.create(
-            customer=customer_id,
-            return_url=return_url,
-        )
-    except stripe.error.StripeError as e:
-        raise HTTPException(status_code=500, detail=f"Stripe portal error: {e.user_message or str(e)}")
+        # IMPORTANT: reuse the same helper you use in /sync-user or /subscription-state
+        # It should return a Stripe customer_id for this user_id
+        customer_id = get_or_create_customer_for_user(body.user_id)
 
-    return {"url": portal_session.url}
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=FRONTEND_RETURN_URL,
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code(400), detail=str(e))
+
 
 
 # ============================================================
