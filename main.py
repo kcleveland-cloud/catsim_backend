@@ -218,7 +218,8 @@ async def create_checkout_session(request: Request):
     """
     Create a Stripe Checkout Session for Standard or Pro subscription.
 
-    Accepts a very flexible JSON body from the frontend. Examples:
+    Accepts flexible JSON from frontend, e.g.:
+
       {
         "user_id": "...",
         "email": "...",
@@ -226,36 +227,36 @@ async def create_checkout_session(request: Request):
         "tier": "pro"
       }
 
-      or even:
+      or:
       {
         "auth0_sub": "...",
-        "email": "...",
-        "plan": "standard"
+        "plan": "Standard"
       }
     """
     try:
         data = await request.json()
 
-        # --- Extract user identity ---
+        # --- Extract identity ---
         user_id = data.get("user_id") or data.get("auth0_sub")
-        email = data.get("email")
+        email = data.get("email") or ""   # optional
         name = data.get("name")
 
-        if not user_id or not email:
+        if not user_id:
             raise HTTPException(
                 status_code=400,
-                detail="Missing user_id or email for checkout session."
+                detail="Missing user_id/auth0_sub for checkout session."
             )
 
-        # --- Determine tier/plan ---
-        # Accepts "tier" or "plan", case-insensitive, defaults to "pro"
-        raw_tier = (data.get("tier") or data.get("plan") or "pro").lower()
-        if raw_tier not in ("standard", "pro"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid tier/plan '{raw_tier}', expected 'standard' or 'pro'."
-            )
-        tier = raw_tier
+        # --- Determine tier/plan (very forgiving) ---
+        raw_tier = str(data.get("tier") or data.get("plan") or "pro").strip().lower()
+
+        if raw_tier.startswith("pro"):
+            tier = "pro"
+        elif raw_tier.startswith("std") or raw_tier.startswith("standard") or raw_tier.startswith("basic"):
+            tier = "standard"
+        else:
+            # default to pro if weird value
+            tier = "pro"
 
         # Map to Stripe price ID
         if tier == "standard":
@@ -305,6 +306,7 @@ async def create_checkout_session(request: Request):
     except Exception as e:
         print("create_checkout_session error:", repr(e))
         raise HTTPException(status_code=500, detail=f"CHECKOUT_ERROR: {e}")
+
 
 
 @app.post("/create-portal-session")
