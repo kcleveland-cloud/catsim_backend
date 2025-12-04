@@ -271,7 +271,8 @@ def sync_subscriptions_from_stripe(
     subs = stripe.Subscription.list(
         customer=customer.id,
         status="all",
-        expand=["data.items.data.price.product"],
+        # We only need price.id; no deep expand needed
+        # expand=["data.items.data.price.product"],
         limit=20,
     )
 
@@ -712,6 +713,8 @@ async def stripe_webhook(
     request: Request,
     stripe_signature: str = Header(None, alias="Stripe-Signature"),
 ):
+    # Just call the main handler
+    return await stripe_webhook(request, stripe_signature)
     """
     Basic Stripe webhook endpoint.
 
