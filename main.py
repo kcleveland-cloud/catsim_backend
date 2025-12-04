@@ -271,7 +271,7 @@ def sync_subscriptions_from_stripe(
     subs = stripe.Subscription.list(
         customer=customer.id,
         status="all",
-        # We only need price.id; no deep expand needed
+        # Removed deep expand to avoid Stripe depth error
         # expand=["data.items.data.price.product"],
         limit=20,
     )
@@ -284,13 +284,18 @@ def sync_subscriptions_from_stripe(
     result: List[Subscription] = []
 
     for s in subs.auto_paging_iter():
-        sub_id = s.id
+        # Normalize to a plain dict so we can safely access keys
+        s_dict = s.to_dict() if hasattr(s, "to_dict") else dict(s)
+
+        sub_id = s_dict["id"]
         plan_key = None
 
-        # Determine plan_key from line items
-        for item in s["items"]["data"]:
-            price_id = item["price"]["id"]
-            if price_id in PRICE_ID_TO_PLAN_KEY:
+        # Determine plan_key from line items using PRICE_ID_TO_PLAN_KEY
+        items = s_dict.get("items", {}).get("data", []) or []
+        for item in items:
+            price = item.get("price") or {}
+            price_id = price.get("id")
+            if price_id and price_id in PRICE_ID_TO_PLAN_KEY:
                 plan_key = PRICE_ID_TO_PLAN_KEY[price_id]
                 break
 
@@ -302,18 +307,21 @@ def sync_subscriptions_from_stripe(
             )
 
         sub_obj.plan_key = plan_key
-        sub_obj.status = s.status
+        sub_obj.status = s_dict.get("status")
         sub_obj.current_period_end = utc_from_timestamp(
-            s.current_period_end
+            s_dict.get("current_period_end")
         )
-        sub_obj.cancel_at_period_end = bool(s.cancel_at_period_end)
-        sub_obj.raw = json.loads(str(s))
+        sub_obj.cancel_at_period_end = bool(
+            s_dict.get("cancel_at_period_end") or False
+        )
+        sub_obj.raw = s_dict
 
         db.add(sub_obj)
         result.append(sub_obj)
 
     db.commit()
     return result
+
 
 
 def compute_subscription_state(user: User) -> Dict[str, Any]:
@@ -715,6 +723,15 @@ async def stripe_webhook(
 ):
     # Just call the main handler
     return await stripe_webhook(request, stripe_signature)
+
+@app.post("/stripe/webhook")
+async def stripe_webhook_alias(
+    request: Request,
+    stripe_signature: str = Header(None, alias="Stripe-Signature"),
+):
+    # Reuse the main handler so logic stays in one place
+    return await stripe_webhook(request, stripe_signature)
+    
     """
     Basic Stripe webhook endpoint.
 
