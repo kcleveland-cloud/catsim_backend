@@ -227,7 +227,8 @@ async def create_checkout_session(request: Request):
         "tier": "pro"
       }
 
-      or:
+    or:
+
       {
         "auth0_sub": "...",
         "plan": "Standard"
@@ -235,20 +236,26 @@ async def create_checkout_session(request: Request):
     """
     try:
         data = await request.json()
+        print("create_checkout_session incoming:", data)
 
-        # --- Extract identity ---
-        user_id = data.get("user_id") or data.get("auth0_sub")
-        email = data.get("email") or ""   # optional
+        # --- Extract identity (very forgiving) ---
+        user_id = (
+            data.get("user_id")
+            or data.get("auth0_sub")
+            or data.get("sub")
+        )
+        email = data.get("email")  # optional
         name = data.get("name")
 
-        if not user_id:
+        if not user_id and not email:
             raise HTTPException(
                 status_code=400,
-                detail="Missing user_id/auth0_sub for checkout session."
+                detail="Need at least user_id/auth0_sub/sub or email for checkout session."
             )
 
         # --- Determine tier/plan (very forgiving) ---
         raw_tier = str(data.get("tier") or data.get("plan") or "pro").strip().lower()
+        print("Raw tier from frontend:", raw_tier)
 
         if raw_tier.startswith("pro"):
             tier = "pro"
@@ -266,9 +273,11 @@ async def create_checkout_session(request: Request):
 
         if not price_id:
             raise HTTPException(
-                status_code=500,
-                detail=f"Missing Stripe price id for tier '{tier}'. "
-                       "Set STRIPE_PRICE_STANDARD / STRIPE_PRICE_PRO in env."
+                status_code=400,
+                detail=(
+                    f"Missing Stripe price id for tier '{tier}'. "
+                    "Set STRIPE_PRICE_STANDARD / STRIPE_PRICE_PRO environment variables on the backend."
+                ),
             )
 
         # --- Build URLs (allow overrides from frontend or use defaults) ---
@@ -281,8 +290,12 @@ async def create_checkout_session(request: Request):
             + "/?checkout=cancelled"
         )
 
+        print("Using success_url:", success_url)
+        print("Using cancel_url:", cancel_url)
+
         # --- Find or create Stripe customer ---
-        customer = find_or_create_customer(user_id, email, name)
+        customer = find_or_create_customer(user_id or "unknown", email or "", name)
+        print("Using Stripe customer:", customer.id)
 
         # --- Create Stripe Checkout session ---
         session = stripe.checkout.Session.create(
@@ -299,9 +312,12 @@ async def create_checkout_session(request: Request):
             allow_promotion_codes=True,
         )
 
+        print("Created checkout session:", session.id)
         return {"id": session.id, "url": session.url}
 
-    except HTTPException:
+    except HTTPException as e:
+        # Log and re-raise so the client sees the detail
+        print("HTTPException in create_checkout_session:", e.detail)
         raise
     except Exception as e:
         print("create_checkout_session error:", repr(e))
