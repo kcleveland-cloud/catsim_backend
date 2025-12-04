@@ -35,6 +35,12 @@ FRONTEND_BASE_URL = os.getenv(
     "https://cubesimprov2.streamlit.app"  # <-- adjust to your real URL
 )
 
+# Where Stripe Billing Portal sends the user back
+PORTAL_RETURN_URL = os.getenv(
+    "PORTAL_RETURN_URL",
+    FRONTEND_BASE_URL.rstrip("/")        # default: just go back to the app
+)
+
 if not STRIPE_SECRET_KEY:
     raise RuntimeError("STRIPE_SECRET_KEY is not set.")
 
