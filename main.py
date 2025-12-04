@@ -62,7 +62,7 @@ app.add_middleware(
 
 class UserBase(BaseModel):
     user_id: str                # Auth0 sub
-    email: Str
+    email: str
     name: Optional[str] = None
 
 class SyncUserRequest(UserBase):
@@ -80,7 +80,7 @@ class CheckoutSessionRequest(UserBase):
 
 class PortalSessionRequest(BaseModel):
     user_id: Optional[str] = None
-    email: Optional[Str] = None
+    email: Optional[str] = None
 
 # -------------------------
 # Stripe helper functions
