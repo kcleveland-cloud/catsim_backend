@@ -716,21 +716,62 @@ async def create_portal_session(
 # ==========================================================
 
 
+# ==========================================================
+# Stripe webhook
+# ==========================================================
+
 @app.post("/stripe-webhook")
 async def stripe_webhook(
     request: Request,
     stripe_signature: str = Header(None, alias="Stripe-Signature"),
 ):
-    # Just call the main handler
-    return await stripe_webhook(request, stripe_signature)
+    """
+    Primary Stripe webhook endpoint.
+    In Stripe dashboard, you can point webhooks to:
+      https://catsim-backend.onrender.com/stripe-webhook
+    """
+    payload = await request.body()
+
+    if not STRIPE_WEBHOOK_SECRET:
+        # If you haven't set a webhook secret yet, accept but just log.
+        print("Webhook received but STRIPE_WEBHOOK_SECRET is not set.")
+        print("Raw payload:", payload.decode("utf-8"))
+        return {"received": True}
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=stripe_signature,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except Exception as e:
+        print("stripe_webhook signature error:", repr(e))
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    event_type = event["type"]
+    obj = event["data"]["object"]
+    print("Stripe event:", event_type)
+
+    # TODO: later you can handle specific events here, e.g.:
+    # - checkout.session.completed
+    # - customer.subscription.created
+    # - customer.subscription.updated
+    # For now, we just acknowledge.
+    return {"received": True}
+
 
 @app.post("/stripe/webhook")
 async def stripe_webhook_alias(
     request: Request,
     stripe_signature: str = Header(None, alias="Stripe-Signature"),
 ):
-    # Reuse the main handler so logic stays in one place
+    """
+    Alias so both /stripe-webhook and /stripe/webhook work.
+    Stripe is currently calling /stripe/webhook (with a slash),
+    so we forward to the main handler above.
+    """
     return await stripe_webhook(request, stripe_signature)
+
     
     """
     Basic Stripe webhook endpoint.
