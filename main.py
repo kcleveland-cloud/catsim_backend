@@ -15,7 +15,7 @@ import os
 import stripe
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, HttpUrl
+from pydantic import BaseModel, HttpUrl
 from typing import Optional, Literal
 
 # -------------------------
@@ -62,7 +62,7 @@ app.add_middleware(
 
 class UserBase(BaseModel):
     user_id: str                # Auth0 sub
-    email: EmailStr
+    email: Str
     name: Optional[str] = None
 
 class SyncUserRequest(UserBase):
@@ -80,7 +80,7 @@ class CheckoutSessionRequest(UserBase):
 
 class PortalSessionRequest(BaseModel):
     user_id: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[Str] = None
 
 # -------------------------
 # Stripe helper functions
