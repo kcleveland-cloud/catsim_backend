@@ -1,452 +1,322 @@
+# main.py — CATSIM backend for Auth0 + Stripe (Render)
+#
+# Endpoints:
+#   POST /sync-user
+#   POST /subscription-state
+#   POST /create-checkout-session
+#   POST /create-portal-session
+#   POST /stripe-webhook
+#
+# This version uses Stripe as the source of truth:
+# - We do NOT use a DB; we look up customers/subscriptions directly in Stripe.
+# - Customers are keyed by email + metadata["user_id"] (Auth0 sub).
+
 import os
-from datetime import datetime
-from functools import lru_cache
-
-import requests
 import stripe
-from fastapi import FastAPI, Request, HTTPException, Depends, Body
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from jose import jwt
-from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    DateTime,
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from pydantic import BaseModel, EmailStr, HttpUrl
+from typing import Optional, Literal
 
-# ============================================================
-# Environment variables
-# ============================================================
+# -------------------------
+# Environment configuration
+# -------------------------
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")  # sk_test_xxx or sk_live_xxx
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# Frontend base URL for redirecting back from Stripe
+# Price IDs for your Standard/Pro subscription products (from Stripe dashboard)
+STRIPE_PRICE_STANDARD = os.getenv("STRIPE_PRICE_STANDARD")  # e.g. price_123
+STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO")            # e.g. price_456
+
+# Frontend base URL (your Streamlit app)
 FRONTEND_BASE_URL = os.getenv(
     "FRONTEND_BASE_URL",
-    "https://cubesimprov2-noruuoxdtsrjzdskhuobbr.streamlit.app",
+    "https://cubesimprov2.streamlit.app"  # <-- adjust to your real URL
 )
 
-# Stripe price IDs (set all of these in Render)
-PRICE_STANDARD_MONTHLY = os.getenv("STRIPE_PRICE_STANDARD_MONTHLY")
-PRICE_STANDARD_YEARLY = os.getenv("STRIPE_PRICE_STANDARD_YEARLY")
-PRICE_PRO_MONTHLY = os.getenv("STRIPE_PRICE_PRO_MONTHLY")
-PRICE_PRO_YEARLY = os.getenv("STRIPE_PRICE_PRO_YEARLY")
-PRICE_ACADEMIC_YEARLY = os.getenv("STRIPE_PRICE_ACADEMIC_YEARLY")
-PRICE_DEPT_YEARLY = os.getenv("STRIPE_PRICE_DEPT_YEARLY")
+if not STRIPE_SECRET_KEY:
+    raise RuntimeError("STRIPE_SECRET_KEY is not set.")
 
-PRICE_IDS = {
-    "standard_monthly": PRICE_STANDARD_MONTHLY,
-    "standard_yearly": PRICE_STANDARD_YEARLY,
-    "pro_monthly":      PRICE_PRO_MONTHLY,
-    "pro_yearly":       PRICE_PRO_YEARLY,
-    "academic_yearly":  PRICE_ACADEMIC_YEARLY,
-    "dept_yearly":      PRICE_DEPT_YEARLY,
-}
+stripe.api_key = STRIPE_SECRET_KEY
 
-# Optional: Auth0 (not required by the current Streamlit flow, but available)
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN")
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")  # your API identifier in Auth0
-AUTH0_ISSUER = f"https://{AUTH0_DOMAIN}/" if AUTH0_DOMAIN else None
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-
-if not STRIPE_API_KEY:
-    raise RuntimeError("STRIPE_API_KEY is not set")
-
-stripe.api_key = STRIPE_API_KEY
-
-# ============================================================
-# Database setup (SQLAlchemy)
-# ============================================================
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    auth0_sub = Column(String, unique=True, index=True, nullable=False)
-    email = Column(String, index=True)
-    stripe_customer_id = Column(String, index=True)
-    stripe_subscription_id = Column(String, index=True)
-
-    # plan can be either a Stripe price ID or a friendly label like 'standard' / 'pro'
-    plan = Column(String)
-    status = Column(String)  # 'trialing', 'active', 'canceled', etc.
-    trial_end = Column(DateTime)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
-
-
-# Auto-create tables in Render Postgres
-Base.metadata.create_all(bind=engine)
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# ============================================================
-# Auth0 helpers (optional – not required by current flow)
-# ============================================================
-
-@lru_cache()
-def get_jwks():
-    if not AUTH0_DOMAIN:
-        raise RuntimeError("AUTH0_DOMAIN is not set")
-    jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
-    resp = requests.get(jwks_url)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def verify_token(token: str):
-    if not AUTH0_AUDIENCE or not AUTH0_ISSUER:
-        raise RuntimeError("AUTH0_AUDIENCE or AUTH0_ISSUER not configured")
-
-    jwks = get_jwks()
-    unverified_header = jwt.get_unverified_header(token)
-
-    rsa_key = {}
-    for key in jwks["keys"]:
-        if key["kid"] == unverified_header["kid"]:
-            rsa_key = {
-                "kty": key["kty"],
-                "kid": key["kid"],
-                "use": key["use"],
-                "n": key["n"],
-                "e": key["e"],
-            }
-            break
-
-    if not rsa_key:
-        raise HTTPException(status_code=401, detail="Invalid token header")
-
-    try:
-        payload = jwt.decode(
-            token,
-            rsa_key,
-            algorithms=["RS256"],
-            audience=AUTH0_AUDIENCE,
-            issuer=AUTH0_ISSUER,
-        )
-        return payload
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def get_current_user_payload(request: Request):
-    """Not used by current endpoints, but handy if you later add /me endpoints."""
-    auth_header = request.headers.get("Authorization")
-    if not auth_header:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-
-    token = parts[1]
-    return verify_token(token)
-
-
-# ============================================================
-# FastAPI app + CORS
-# ============================================================
+# -------------------------
+# FastAPI app & CORS
+# -------------------------
 
 app = FastAPI()
 
-# For launch: allow all origins (you can lock this down later)
+frontend_origin = FRONTEND_BASE_URL.rstrip("/")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # e.g., ["https://cubesimprov2-....streamlit.app"]
+    allow_origins=[frontend_origin, "*"],  # you can tighten this later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -------------------------
+# Pydantic models
+# -------------------------
 
-# ============================================================
-# Health check
-# ============================================================
+class UserBase(BaseModel):
+    user_id: str                # Auth0 sub
+    email: EmailStr
+    name: Optional[str] = None
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+class SyncUserRequest(UserBase):
+    pass
+
+class SubscriptionStateRequest(UserBase):
+    pass
+
+class CheckoutSessionRequest(UserBase):
+    tier: Literal["standard", "pro"]
+
+    # Optional override URLs; otherwise we derive from FRONTEND_BASE_URL
+    success_url: Optional[HttpUrl] = None
+    cancel_url: Optional[HttpUrl] = None
+
+class PortalSessionRequest(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+# -------------------------
+# Stripe helper functions
+# -------------------------
+
+def find_or_create_customer(user_id: str, email: str, name: Optional[str]) -> stripe.Customer:
+    """
+    Find an existing Stripe customer by metadata.user_id or email.
+    If not found, create a new one.
+    """
+    # 1) Try search by metadata.user_id
+    try:
+        search = stripe.Customer.search(
+            query=f'metadata["user_id"]:"{user_id}"'
+        )
+        if search.data:
+            return search.data[0]
+    except Exception:
+        # Search may not be enabled; fall through to email lookup
+        pass
+
+    # 2) Try list by email
+    customers = stripe.Customer.list(email=email, limit=1)
+    if customers.data:
+        cust = customers.data[0]
+        # Ensure metadata.user_id is set for future lookups
+        metadata = dict(cust.metadata or {})
+        if metadata.get("user_id") != user_id:
+            metadata["user_id"] = user_id
+            stripe.Customer.modify(cust.id, metadata=metadata)
+        return cust
+
+    # 3) No customer found → create new
+    customer = stripe.Customer.create(
+        email=email,
+        name=name,
+        metadata={"user_id": user_id},
+    )
+    return customer
 
 
-# ============================================================
-# /sync-user – called by Streamlit after Auth0 login
-#    body: { "auth0_sub": "...", "email": "...", "stripe_customer_id": "cus_xxx" (optional) }
-# ============================================================
+def get_subscription_state_for_customer(customer: stripe.Customer) -> dict:
+    """
+    Return a simplified subscription state dict for the given Stripe customer.
+    Looks at active subscriptions and picks the 'highest' plan it finds.
+    """
+    subs = stripe.Subscription.list(
+        customer=customer.id,
+        status="all",
+        expand=["data.items.data.price.product"],
+        limit=10,
+    )
+
+    plan = "free"
+    status = "none"
+    current_period_end = None
+    raw_subscriptions = []
+
+    for s in subs.auto_paging_iter():
+        raw_subscriptions.append(
+            {
+                "id": s.id,
+                "status": s.status,
+                "cancel_at_period_end": s.cancel_at_period_end,
+            }
+        )
+        if s.status in ("active", "trialing"):
+            # We treat "pro" as higher than "standard".
+            for item in s["items"]["data"]:
+                price_id = item["price"]["id"]
+                if price_id == STRIPE_PRICE_PRO:
+                    plan = "pro"
+                elif price_id == STRIPE_PRICE_STANDARD and plan != "pro":
+                    plan = "standard"
+            status = s.status
+            current_period_end = s.current_period_end
+
+    return {
+        "plan": plan,
+        "status": status,
+        "current_period_end": current_period_end,
+        "customer_id": customer.id,
+        "subscriptions": raw_subscriptions,
+    }
+
+# -------------------------
+# API endpoints
+# -------------------------
 
 @app.post("/sync-user")
-def sync_user(
-    payload: dict = Body(...),
-    db: Session = Depends(get_db),
-):
-    auth0_sub = payload.get("auth0_sub")
-    email = payload.get("email")
-    stripe_customer_id = payload.get("stripe_customer_id")
-
-    if not auth0_sub and not email:
-        raise HTTPException(status_code=400, detail="Missing auth0_sub or email")
-
-    # Prefer auth0_sub as primary key
-    user = None
-    if auth0_sub:
-        user = db.query(User).filter(User.auth0_sub == auth0_sub).first()
-
-    if not user and email:
-        # Fallback: maybe we only had an email-based user before
-        user = db.query(User).filter(User.email == email).first()
-
-    if not user:
-        user = User(
-            auth0_sub=auth0_sub or (email or "unknown"),
-            email=email,
-            stripe_customer_id=stripe_customer_id,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        db.add(user)
-    else:
-        # Update fields
-        if email and not user.email:
-            user.email = email
-        if stripe_customer_id:
-            user.stripe_customer_id = stripe_customer_id
-        user.updated_at = datetime.utcnow()
-
-    db.commit()
-    db.refresh(user)
-
-    return {
-        "auth0_sub": user.auth0_sub,
-        "email": user.email,
-        "stripe_customer_id": user.stripe_customer_id,
-        "plan": user.plan,
-        "status": user.status,
-        "trial_end": user.trial_end.isoformat() if user.trial_end else None,
-    }
-
-
-# ============================================================
-# /subscription-state – called by Streamlit to set plan on load
-#    GET /subscription-state?auth0_sub=...
-# ============================================================
-
-@app.get("/subscription-state")
-def subscription_state(
-    auth0_sub: str,
-    db: Session = Depends(get_db),
-):
-    user = db.query(User).filter(User.auth0_sub == auth0_sub).first()
-    if not user:
-        # No subscription known for this user yet
+def sync_user(body: SyncUserRequest):
+    """
+    Called by frontend when user logs in.
+    Ensures a Stripe customer exists and returns subscription state.
+    """
+    try:
+        customer = find_or_create_customer(body.user_id, body.email, body.name)
+        sub_state = get_subscription_state_for_customer(customer)
         return {
-            "plan": "none",
-            "status": "none",
-            "price_id": None,
-            "current_period_end": None,
-            "customer_id": None,
+            "ok": True,
+            "customer_id": customer.id,
+            "subscription": sub_state,
         }
-
-    return {
-        "plan": user.plan or "none",
-        "status": user.status or "none",
-        "price_id": user.plan,  # you can change this if you prefer friendly names
-        "current_period_end": user.trial_end.isoformat() if user.trial_end else None,
-        "customer_id": user.stripe_customer_id,
-    }
+    except Exception as e:
+        print("sync_user error:", repr(e))
+        raise HTTPException(status_code=500, detail=f"SYNC_USER_ERROR: {e}")
 
 
-# ============================================================
-# Helper: upsert user by Stripe customer (used by webhook)
-# ============================================================
+@app.post("/subscription-state")
+def subscription_state(body: SubscriptionStateRequest):
+    """
+    Return the current subscription state for this user.
+    """
+    try:
+        customer = find_or_create_customer(body.user_id, body.email, body.name)
+        sub_state = get_subscription_state_for_customer(customer)
+        return {
+            "ok": True,
+            "customer_id": customer.id,
+            "subscription": sub_state,
+        }
+    except Exception as e:
+        print("subscription_state error:", repr(e))
+        raise HTTPException(status_code=500, detail=f"SUB_STATE_ERROR: {e}")
 
-def upsert_user_from_stripe(
-    db: Session,
-    customer_id: str,
-    subscription_id: str | None = None,
-):
-    # Fetch customer info from Stripe to get email
-    stripe_customer = stripe.Customer.retrieve(customer_id)
-    email = stripe_customer.get("email")
-
-    user = None
-    # First, try by Stripe customer ID
-    user = db.query(User).filter(User.stripe_customer_id == customer_id).first()
-
-    # Then by email (if present)
-    if not user and email:
-        user = db.query(User).filter(User.email == email).first()
-
-    # Then by auth0_sub == email (if sync-user created it like that)
-    if not user and email:
-        user = db.query(User).filter(User.auth0_sub == email).first()
-
-    if not user:
-        # Create a new user row if nothing matches
-        user = User(
-            auth0_sub=email or f"stripe:{customer_id}",
-            email=email,
-            stripe_customer_id=customer_id,
-            created_at=datetime.utcnow(),
-        )
-        db.add(user)
-    else:
-        # Just ensure we keep stripe_customer_id synced
-        user.stripe_customer_id = customer_id
-
-    if subscription_id:
-        user.stripe_subscription_id = subscription_id
-
-    user.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(user)
-    return user
-
-
-# ============================================================
-# /create-checkout-session – called by Streamlit sidebar buttons
-#    body: { "plan_key": "...", "email": "..." }
-# ============================================================
 
 @app.post("/create-checkout-session")
-def create_checkout_session(
-    payload: dict = Body(...),
-    db: Session = Depends(get_db),
-):
-    plan_key = payload.get("plan_key")
-    email = payload.get("email")
-
-    if not plan_key or not email:
-        raise HTTPException(status_code=400, detail="Missing plan_key or email")
-
-    price_id = PRICE_IDS.get(plan_key)
-    if not price_id:
-        raise HTTPException(status_code=400, detail=f"Unknown plan_key: {plan_key}")
-
-    # Find or create Stripe Customer by email
+def create_checkout_session(body: CheckoutSessionRequest):
+    """
+    Create a Stripe Checkout Session for Standard or Pro subscription.
+    Frontend will redirect the user to session.url.
+    """
     try:
-        customers = stripe.Customer.list(email=email, limit=1).data
-        if customers:
-            customer = customers[0]
+        customer = find_or_create_customer(body.user_id, body.email, body.name)
+
+        if body.tier == "standard":
+            price_id = STRIPE_PRICE_STANDARD
         else:
-            customer = stripe.Customer.create(email=email)
-    except stripe.error.StripeError as e:
-        raise HTTPException(status_code=500, detail=f"Stripe customer error: {e.user_message or str(e)}")
+            price_id = STRIPE_PRICE_PRO
 
-    customer_id = customer["id"]
+        if not price_id:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Missing Stripe price id for tier '{body.tier}'. "
+                       "Set STRIPE_PRICE_STANDARD / STRIPE_PRICE_PRO."
+            )
 
-    # Upsert user in DB (by email/auth0_sub), store stripe_customer_id
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        user = User(
-            auth0_sub=email,  # we don't have sub here; this will be unified by /sync-user
-            email=email,
-            stripe_customer_id=customer_id,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+        success_url = str(body.success_url) if body.success_url else (
+            FRONTEND_BASE_URL.rstrip("/") + "/?checkout=success&session_id={CHECKOUT_SESSION_ID}"
         )
-        db.add(user)
-    else:
-        user.stripe_customer_id = customer_id
-        user.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(user)
+        cancel_url = str(body.cancel_url) if body.cancel_url else (
+            FRONTEND_BASE_URL.rstrip("/") + "/?checkout=cancelled"
+        )
 
-    # Create Stripe Checkout Session
-    success_url = f"{FRONTEND_BASE_URL}?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = FRONTEND_BASE_URL
-
-    try:
         session = stripe.checkout.Session.create(
             mode="subscription",
-            payment_method_types=["card"],
-            customer=customer_id,
+            customer=customer.id,
             line_items=[
                 {
                     "price": price_id,
                     "quantity": 1,
                 }
             ],
-            allow_promotion_codes=True,
             success_url=success_url,
             cancel_url=cancel_url,
+            allow_promotion_codes=True,
         )
-    except stripe.error.StripeError as e:
-        raise HTTPException(status_code=500, detail=f"Stripe checkout error: {e.user_message or str(e)}")
 
-    return {"url": session.url}
+        return {"id": session.id, "url": session.url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("create_checkout_session error:", repr(e))
+        raise HTTPException(status_code=500, detail=f"CHECKOUT_ERROR: {e}")
 
 
-# ============================================================
-# /create-portal-session – manage billing & invoices
-#    body: { "customer_id": "cus_xxx" }
-# ============================================================
-
-from pydantic import BaseModel
-from fastapi import HTTPException
-
-FRONTEND_RETURN_URL = os.getenv(
+PORTAL_RETURN_URL = os.getenv(
     "PORTAL_RETURN_URL",
-    "https://your-streamlit-app-url"  # <-- set this
+    FRONTEND_BASE_URL.rstrip("/")  # user returns to app after managing billing
 )
-
-class PortalSessionRequest(BaseModel):
-    user_id: str  # Auth0 sub or whatever you're using
-
 
 @app.post("/create-portal-session")
 def create_portal_session(body: PortalSessionRequest):
+    """
+    Create a Stripe Billing Portal session for the user.
+    Frontend sends: { "user_id": "...", "email": "..." }
+    """
     try:
-        # IMPORTANT: reuse the same helper you use in /sync-user or /subscription-state
-        # It should return a Stripe customer_id for this user_id
-        customer_id = get_or_create_customer_for_user(body.user_id)
+        if not body.email and not body.user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Need at least email or user_id to create billing portal session."
+            )
+
+        # If user_id is missing but we have email, we can still find the customer.
+        user_id = body.user_id or "unknown"
+
+        # Use a dummy name; not needed for portal.
+        customer = find_or_create_customer(user_id, body.email or "", None)
 
         session = stripe.billing_portal.Session.create(
-            customer=customer_id,
-            return_url=FRONTEND_RETURN_URL,
+            customer=customer.id,
+            return_url=PORTAL_RETURN_URL,
         )
         return {"url": session.url}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code(400), detail=str(e))
+        print("create_portal_session error:", repr(e))
+        raise HTTPException(status_code=500, detail=f"PORTAL_ERROR: {e}")
 
 
+# -------------------------
+# Stripe webhook
+# -------------------------
 
-# ============================================================
-# /stripe/webhook – Stripe → backend (subscription updates)
-# ============================================================
-
-@app.post("/stripe/webhook")
+@app.post("/stripe-webhook")
 async def stripe_webhook(
     request: Request,
-    db: Session = Depends(get_db),
+    stripe_signature: str = Header(None, alias="Stripe-Signature"),
 ):
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="Stripe webhook secret not configured",
-        )
+    """
+    Stripe webhook endpoint.
 
+    Configure this URL in your Stripe dashboard:
+      https://<your-render-backend>/stripe-webhook
+
+    And set STRIPE_WEBHOOK_SECRET to the signing secret.
+    """
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
+    sig_header = stripe_signature
+
+    if not STRIPE_WEBHOOK_SECRET:
+        # If you haven't configured it yet, just log and return 200
+        print("Webhook received but STRIPE_WEBHOOK_SECRET is not set.")
+        return {"received": True}
 
     try:
         event = stripe.Webhook.construct_event(
@@ -454,34 +324,37 @@ async def stripe_webhook(
             sig_header=sig_header,
             secret=STRIPE_WEBHOOK_SECRET,
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid webhook: {str(e)}")
+    except ValueError as e:
+        print("Invalid payload:", e)
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        print("Invalid signature:", e)
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
+    # Handle the events you care about. For now we just log them.
     event_type = event["type"]
-    data = event["data"]["object"]
+    obj = event["data"]["object"]
+    print(f"Stripe event received: {event_type}")
 
-    # Handle subscription lifecycle events
-    if event_type in [
-        "customer.subscription.created",
-        "customer.subscription.updated",
-        "customer.subscription.deleted",
-    ]:
-        sub = data
-        customer_id = sub["customer"]
-        subscription_id = sub["id"]
-        status = sub["status"]           # 'active', 'trialing', 'canceled', ...
-        plan_id = sub["items"]["data"][0]["plan"]["id"]
-        trial_end = (
-            datetime.fromtimestamp(sub["trial_end"]) if sub.get("trial_end") else None
-        )
-
-        user = upsert_user_from_stripe(db, customer_id, subscription_id=subscription_id)
-        user.status = status
-        user.plan = plan_id
-        user.trial_end = trial_end
-        user.updated_at = datetime.utcnow()
-        db.commit()
-
-    # You can add more event types here if needed
+    # Example: you could inspect obj here and eventually sync to a DB
+    # if event_type == "checkout.session.completed":
+    #     ...
+    # elif event_type == "customer.subscription.updated":
+    #     ...
+    # etc.
 
     return {"received": True}
+
+
+# -------------------------
+# Local dev entrypoint
+# -------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,
+    )
