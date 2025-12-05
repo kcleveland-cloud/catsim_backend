@@ -49,6 +49,19 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from sqlalchemy.types import JSON as SAJSON
 
 # ==========================================================
+# Helper: Academic .edu email check
+# ==========================================================
+
+def is_edu_email(email: Optional[str]) -> bool:
+    """
+    Return True if the email ends with .edu (case-insensitive).
+    Used to gate Academic pricing.
+    """
+    if not email:
+        return False
+    return email.strip().lower().endswith(".edu")
+
+# ==========================================================
 # Environment & Stripe setup
 # ==========================================================
 
@@ -321,7 +334,6 @@ def sync_subscriptions_from_stripe(
 
     db.commit()
     return result
-
 
 
 def compute_subscription_state(user: User) -> Dict[str, Any]:
@@ -610,6 +622,13 @@ async def create_checkout_session(
                 detail="create-checkout-session requires 'email'.",
             )
 
+        # Enforce .edu emails for Academic plan
+        if plan_key == "academic_yearly" and not is_edu_email(email):
+            raise HTTPException(
+                status_code=400,
+                detail="Academic plan requires a valid .edu email address."
+            )
+
         user = get_or_create_user(db, auth0_sub, email, name)
         customer = find_or_create_stripe_customer(db, user)
 
@@ -715,11 +734,6 @@ async def create_portal_session(
 # Stripe webhook
 # ==========================================================
 
-
-# ==========================================================
-# Stripe webhook
-# ==========================================================
-
 @app.post("/stripe-webhook")
 async def stripe_webhook(
     request: Request,
@@ -752,11 +766,7 @@ async def stripe_webhook(
     obj = event["data"]["object"]
     print("Stripe event:", event_type)
 
-    # TODO: later you can handle specific events here, e.g.:
-    # - checkout.session.completed
-    # - customer.subscription.created
-    # - customer.subscription.updated
-    # For now, we just acknowledge.
+    # For now we just acknowledge; your subscription sync happens via /sync-user.
     return {"received": True}
 
 
@@ -771,43 +781,6 @@ async def stripe_webhook_alias(
     so we forward to the main handler above.
     """
     return await stripe_webhook(request, stripe_signature)
-
-    
-    """
-    Basic Stripe webhook endpoint.
-
-    Configure in Stripe:
-      https://<your-backend>/stripe-webhook
-
-    Handles checkout.session.completed & customer.subscription.* to keep DB
-    in sync. (For now we just sync from Stripe on demand — this can be
-    expanded later.)
-    """
-    payload = await request.body()
-
-    if not STRIPE_WEBHOOK_SECRET:
-        print("Webhook received but STRIPE_WEBHOOK_SECRET is not set.")
-        return {"received": True}
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload,
-            sig_header=stripe_signature,
-            secret=STRIPE_WEBHOOK_SECRET,
-        )
-    except Exception as e:
-        print("stripe_webhook signature error:", repr(e))
-        raise HTTPException(status_code=400, detail="Invalid webhook signature")
-
-    event_type = event["type"]
-    obj = event["data"]["object"]
-    print("Stripe event:", event_type)
-
-    # For now we just log events; your /sync-user & /subscription-state
-    # endpoints pull truth from Stripe and update DB.
-    # If you want, this can later be extended to upsert users/subs directly.
-
-    return {"received": True}
 
 
 # ==========================================================
